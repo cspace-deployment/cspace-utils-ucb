@@ -1,8 +1,8 @@
-/* bampfa_collectionitems_vw.sql
+/* VW-bampfa_collectionitems_vw.sql
  *  View used to get live data in support of several functions, including Inject Metadata
  *  CRH 10/22/2014
  *  CRH 10/27/2014 Measurements subst hyphen with space. Utils schema.
- *  CRH 11/25/2014 Added artistdisplayoverride
+ *  CRH 11/25/2014 Added artistDisplayOverride
  *  CRH 04/25/2015 Added several fields; see Jira BAMPFA-402
  *  CRH 07/30/2015 Added Acquisition Method BAMPFA-446
  *  LKV 09/28/2016 BAMPFA-507: Add call to new function utils.get_first_blobcsid_displevel to
@@ -16,9 +16,26 @@
  *  LKV 11/06/2026 CSW-1033:
       re-write to remove get_object_image_count, get_first_blobcsid_displevel, concat_artists
       add exclusions for deleted relations, blobs, persons
+ *  LKV 11/18/2026 CSW-1033:
+      match artists to persons on refname up to the short identifier, to handle stale display names
+      use the first non-deleted artist for the first-artist fields
+      merge image count and image 1 into one media CTE; move ORDER BY to bampfa_collectionitems_vw.sh
+      wrap in a transaction; set owner to nuxeo_bampfa; grant only to roles that exist
+ *  RM 11/23/2026 CSW-1033:
+      set search_path so names resolve the same whoever runs this script
+      add tie-breakers when picking image 1 (NULLS LAST, then media id)
+      raise a notice when a grant is skipped because the role doesn't exist
+
+  To run: psql -v ON_ERROR_STOP=1 -d bampfa_domain_bampfa -f VW-bampfa_collectionitems_vw.sql
+  as nuxeo_bampfa or a role that is a member of it; the last line printed should be COMMIT.
 */
 
 BEGIN;
+
+-- resolve unqualified table and function names (e.g. GETDISPL) in public, regardless of
+-- the search_path of the role running this script; reverts at COMMIT
+--
+SET LOCAL search_path = public;
 
 -- drop view utils.bampfa_collectionitems_vw
 --
@@ -87,7 +104,7 @@ artists AS (
 ),
 
 -- get artist data for first non-deleted, non-null artist
--- pos for birth and dead dates are all null, and there are no parentid duplicates
+-- pos for birth and death dates are all null, and there are no parentid duplicates
 --
 firstartists AS (
   SELECT
@@ -171,9 +188,10 @@ objectmedia AS (
   SELECT
     rc.objectcsid,
     COUNT(DISTINCT mc.id) AS imagecount,	-- get imagecount for non-deleted media
-    (ARRAY_AGG(mc.blobcsid ORDER BY csc.updatedat DESC, mc.blobcsid DESC)
+    -- both ORDER BYs must stay identical so blobcsid and displevel come from the same media record
+    (ARRAY_AGG(mc.blobcsid ORDER BY csc.updatedat DESC NULLS LAST, mc.blobcsid DESC, mc.id DESC)
        FILTER (WHERE mb.imagenumber = 1))[1] AS image1blobcsid,	-- get blobcsid for imagenumber 1
-    (ARRAY_AGG(mb.websitedisplaylevel ORDER BY csc.updatedat DESC, mc.blobcsid DESC)
+    (ARRAY_AGG(mb.websitedisplaylevel ORDER BY csc.updatedat DESC NULLS LAST, mc.blobcsid DESC, mc.id DESC)
        FILTER (WHERE mb.imagenumber = 1))[1] AS image1displevel	-- get displevel for imagenumber 1
   FROM relations_common rc
     JOIN misc mrc ON rc.id = mrc.id
@@ -319,6 +337,8 @@ BEGIN
   FOREACH r IN ARRAY ARRAY['reporters_bampfa', 'reader_bampfa'] LOOP
     IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = r) THEN
       EXECUTE format('GRANT SELECT ON utils.bampfa_collectionitems_vw TO %I', r);
+    ELSE
+      RAISE NOTICE 'role % does not exist; skipped GRANT SELECT on utils.bampfa_collectionitems_vw', r;
     END IF;
   END LOOP;
 END $$;
